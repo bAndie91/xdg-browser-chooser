@@ -72,9 +72,9 @@ sub host_pattern_to_regex {
 	my $subdomains = ($p =~ s/^\.//);
 	return undef if $p eq '';
 	my $body = join '\.', map {
-		$_ eq '*'
-			? '[^.]+'                                      # a whole label
-			: join('[^.]*', map { quotemeta } split(/\*/, $_, -1))
+		$_ eq '**' ? '[^.]+(?:\.[^.]+)*'                   # one or more whole labels
+		: $_ eq '*' ? '[^.]+'                              # exactly one whole label
+		: join('[^.]*', map { quotemeta } split(/\*+/, $_, -1))   # '*' inside a label
 	} split /\./, $p, -1;
 	$body = '(?:[^.]+\.)*' . $body if $subdomains;
 	return qr/^$body$/;
