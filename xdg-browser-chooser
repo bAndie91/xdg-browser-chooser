@@ -232,27 +232,39 @@ sub mimeapps_files {
 
 sub fallback_file {
 	my $mime = shift;
+	# Candidates are [ desktop file ID, where it was listed, honor Removed Associations? ]
 	my (@defaults, @added, %removed, @cached);
-	for my $f (mimeapps_files()) {
+	my @lists = mimeapps_files();
+	verbose("fallback: mimeapps.list files: " . (@lists ? join(' ', @lists) : '(none)'));
+	verbose("fallback: application dirs: " . join(' ', app_dirs()));
+	for my $f (@lists) {
 		my $l = keyfile_lists($f, $mime);
-		push @defaults, @{ $l->{'Default Applications'} // [] };
-		push @added,    @{ $l->{'Added Associations'}   // [] };
-		$removed{$_} = 1 for @{ $l->{'Removed Associations'} // [] };
+		push @defaults, map { [$_, "Default Applications in $f"] } @{ $l->{'Default Applications'} // [] };
+		push @added,    map { [$_, "Added Associations in $f", 1] } @{ $l->{'Added Associations'} // [] };
+		$removed{$_} //= $f for @{ $l->{'Removed Associations'} // [] };
 	}
 	for my $dir (app_dirs()) {
 		my $f = "$dir/mimeinfo.cache";
-		push @cached, @{ keyfile_lists($f, $mime)->{'MIME Cache'} // [] } if -f $f;
+		push @cached, map { [$_, "MIME Cache in $f"] } @{ keyfile_lists($f, $mime)->{'MIME Cache'} // [] } if -f $f;
 	}
+	my @candidates = (@defaults, @added, @cached);
+	verbose("fallback: " . scalar(@candidates) . " candidate(s) for $mime, best first");
 	my %seen;
-	for my $id (@defaults, grep { !$removed{$_} } @added, @cached) {
-		next if $seen{$id}++;
-		my $f = find_by_id($id) or next;
+	for my $c (@candidates) {
+		my ($id, $src, $honor_removed) = @$c;
+		my $skip = sub { verbose("fallback: $id ($src): skipped, $_[0]") };
+		$skip->("listed in Removed Associations in $removed{$id}"), next
+			if $honor_removed and $removed{$id};
+		$skip->('already considered'), next if $seen{$id}++;
+		my $f = find_by_id($id) or $skip->('no such desktop file'), next;
 		my $de = File::DesktopEntry->new($f);
-		next unless ($de->get('Type') // '') eq 'Application';
-		next if ($de->get('Hidden') // '') eq 'true';
-		next if is_self($de);
+		$skip->("$f is not an Application"), next unless ($de->get('Type') // '') eq 'Application';
+		$skip->("$f is Hidden"), next if ($de->get('Hidden') // '') eq 'true';
+		$skip->("$f would start $APP itself"), next if is_self($de);
+		verbose("fallback: $id ($src): selected, $f");
 		return $f;
 	}
+	verbose("fallback: no usable handler for $mime among " . scalar(@candidates) . " candidate(s)");
 	return;
 }
 
@@ -278,14 +290,28 @@ if ($scheme eq 'http' or $scheme eq 'https') {
 	}
 }
 my $file;
+my $why;    # why the rules did not decide; logged when we fall back
 
-if (defined $host) {
-	my $cfg = $xdg->lookup_config_file('rules.conf');
-	verbose("config: $cfg");
-	for my $rule (load_rules($cfg)) {
+if (!defined $host) {
+	$why = 'the URL has no http(s) host for rules to match';
+}
+elsif (!defined(my $cfg = $xdg->lookup_config_file('rules.conf'))) {
+	$why = 'no rules.conf found';
+}
+else {
+	my @rules = load_rules($cfg);
+	verbose("config: $cfg, " . scalar(@rules) . " rule(s)");
+	verbose("matching host '$host', target '$target'");
+	my $matched = 0;
+	for my $rule (@rules) {
 		next unless ($rule->{kind} eq 'host' ? $host : $target) =~ $rule->{re};
+		$matched++;
 		verbose("rule at line $rule->{line} matched: $rule->{pattern} -> $rule->{app}");
-		my $f = resolve_app($rule->{app}) or next;
+		my $f = resolve_app($rule->{app});
+		unless (defined $f) {
+			verbose("rule at line $rule->{line} skipped, cannot resolve application $rule->{app}");
+			next;
+		}
 		if (is_self(File::DesktopEntry->new($f))) {
 			warn "$APP: $f would start $APP itself, skipping rule at line $rule->{line}\n";
 			next;
@@ -293,10 +319,12 @@ if (defined $host) {
 		$file = $f;
 		last;
 	}
+	$why = $matched ? "$matched rule(s) matched but none was usable" : 'no rule matched'
+		unless defined $file;
 }
 
 unless (defined $file) {
-	verbose("no rule matched, falling back to x-scheme-handler/$scheme");
+	verbose("falling back to the next x-scheme-handler/$scheme handler: $why");
 	$file = fallback_file("x-scheme-handler/$scheme")
 		// die "$APP: no handler found for x-scheme-handler/$scheme\n";
 }
