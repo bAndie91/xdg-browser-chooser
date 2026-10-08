@@ -9,7 +9,8 @@ install: $(INSTALL_TARGET)
 	update-desktop-database
 
 $(INSTALL_TARGET): xdg-browser-chooser.desktop
-	cp -v --no-preserve=ownership $< $@
+	cp -v --no-preserve=ownership,mode --preserve=timestamps $< $@
 
 .PHONY: uninstall
+uninstall:
 	[ ! -e $(INSTALL_TARGET) ] || rm $(INSTALL_TARGET)
