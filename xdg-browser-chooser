@@ -64,25 +64,6 @@ sub usage {
 }
 
 ###############################################################################
-# URL -> (host, "host[:port]/path")
-
-sub split_url {
-	my $uri = shift;
-	my $scheme = lc($uri->scheme // '');
-	return unless $scheme eq 'http' or $scheme eq 'https';
-	my $host = eval { $uri->host };
-	return unless defined $host and length $host;
-	$host = lc $host;
-	$host =~ s/\.$//;
-	my $hostport = $host =~ /:/ ? "[$host]" : $host;     # IPv6 literal
-	my $port = $uri->port;
-	$hostport .= ":$port" if defined $port and $port != $uri->default_port;
-	my $path = $uri->path;
-	$path = '/' if $path eq '';
-	return ($host, $hostport . $path);
-}
-
-###############################################################################
 # Config
 
 sub host_pattern_to_regex {
@@ -277,8 +258,25 @@ sub fallback_file {
 
 ###############################################################################
 
-my $uri = URI->new($url)->canonical;
-my ($host, $target) = split_url($uri);
+# URI does the parsing; canonical() lowercases scheme and host, drops the default port.
+my $uri    = URI->new($url)->canonical;
+my $scheme = lc($uri->scheme // '');
+
+# Rules apply to http(s) URLs only. $host is what host patterns are matched
+# against, $target ("HOST[:PORT]/PATH", see the top comment) is for regexps.
+my ($host, $target);
+if ($scheme eq 'http' or $scheme eq 'https') {
+	my $h = eval { $uri->host };
+	if (defined $h and length $h) {
+		($host = lc $h) =~ s/\.$//;                          # FQDN root dot
+		my $hostport = $host =~ /:/ ? "[$host]" : $host;     # IPv6 literal
+		my $port = $uri->port;
+		$hostport .= ":$port" if defined $port and $port != $uri->default_port;
+		my $path = $uri->path;
+		$path = '/' unless length $path;
+		$target = $hostport . $path;
+	}
+}
 my $file;
 
 if (defined $host) {
@@ -298,7 +296,6 @@ if (defined $host) {
 }
 
 unless (defined $file) {
-	my $scheme = lc($uri->scheme // '');
 	verbose("no rule matched, falling back to x-scheme-handler/$scheme");
 	$file = fallback_file("x-scheme-handler/$scheme")
 		// die "$APP: no handler found for x-scheme-handler/$scheme\n";
