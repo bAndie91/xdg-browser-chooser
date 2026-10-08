@@ -47,6 +47,36 @@ use Getopt::Long qw(:config no_ignore_case bundling);
 use URI;
 
 my $APP  = 'xdg-browser-chooser';
+my $DEFAULT_CONFIG = <<'DEFAULT_CONFIG';
+#   # comment
+#   PATTERN  APPLICATION
+#
+# PATTERN without "/"  -> host name match (case-insensitive):
+#     example.com        exactly that host
+#     .example.com       example.com and any subdomain of it
+#     *.example.com      exactly one extra label; NOT example.com itself
+#     www*.example.com   '*' inside a label matches within that label only
+#     **.example.com     any number of extra labels; NOT example.com itself
+# PATTERN with "/"     -> Perl regexp, must match the *whole* of
+#     HOST[:PORT]/PATH   (no scheme, no query string, no fragment; the port
+#     is present only if it is not the scheme's default one; path is "/" at
+#     minimum, percent-encoded as in the URL).  PATTERN cannot contain
+#     whitespace - use \s or [[:blank:]].
+#
+# APPLICATION          -> an absolute file path (starting with "/"), a desktop
+#     file ID ending in ".desktop" (e.g. "firefox.desktop"), or an application
+#     Name (e.g. "Firefox"). Names are matched case-insensitively. An unescaped
+#     "*" in a Name is a wildcard for any run of characters, so "firefox*"
+#     finds "Firefox ESR"; write "\\*" for a literal star.
+#     Absolute paths are used as-is. A desktop file ID is looked up in the
+#     freedesktop application database. Other values, including names containing
+#     slashes or suffixes such as ".desktop", are treated as Names, not paths
+#     or desktop file IDs. If several applications match, the first one is used
+#     (user applications before system ones, then in file name order).
+#
+# First matching rule wins. If nothing matches, the next handler for
+# x-scheme-handler/<scheme> is used.
+DEFAULT_CONFIG
 my $SELF = abs_path($0) // $0;
 
 my ($opt_dry, $opt_verbose);
@@ -114,25 +144,15 @@ sub load_rules {
 	return @rules;
 }
 
-# First run: write a rules.conf whose content is the documentation in the top
-# comment of this very script, so it always describes what this version understands.
+# First run: write the documented defaults defined near the top of this script.
 sub create_config {
 	my $path = File::Spec->catfile($xdg->config_home, 'rules.conf');
-	open my $in, '<:encoding(UTF-8)', $SELF or do { warn "$APP: $SELF: $!\n"; return };
-	my @doc;
-	while (<$in>) {
-		last unless /^#/;
-		next if /^#!/;
-		push @doc, $_;
-	}
-	close $in;
-	s/\s*\(see fallback_file\(\) below\)// for @doc;    # points into the source, useless in a config
 	my $dir = dirname($path);
 	eval { make_path($dir); 1 } or do { warn "$APP: cannot create $dir: $@"; return };
 	sysopen(my $out, $path, O_WRONLY | O_CREAT | O_EXCL, 0666)
 		or do { warn "$APP: cannot create $path: $!\n"; return };
 	binmode $out, ':encoding(UTF-8)';
-	print $out @doc;
+	print $out $DEFAULT_CONFIG;
 	close $out or do { warn "$APP: $path: $!\n"; return };
 	warn "$APP: no rules.conf found, created $path\n";
 	return $path;
@@ -187,6 +207,29 @@ sub all_desktop_files {
 	return @all_desktop_files;
 }
 
+# Return true if any relevant localized or untranslated Name matches. File::DesktopEntry
+# versions differ in whether get('Name') is locale-aware, so check it first; when
+# it matches there is no need to probe alternate translations.
+sub desktop_name_matches {
+	my ($de, $re) = @_;
+	my $name = $de->get('Name');
+	return 1 if defined $name and $name =~ $re;
+
+	my @locales;
+	my $locale = $ENV{LC_ALL} || $ENV{LC_MESSAGES} || $ENV{LANG} || '';
+	$locale =~ s/\..*//;
+	$locale =~ s/\@.*//;
+	push @locales, $locale if length $locale;
+	push @locales, qw(en_US en C);
+	my %seen;
+	for my $loc (@locales) {
+		next if $seen{$loc}++;
+		my $translated = $de->get("Name[$loc]");
+		return 1 if defined $translated and $translated =~ $re;
+	}
+	return 0;
+}
+
 # Desktop files of the applications whose Name matches $re, in lookup order.
 sub find_by_name {
 	my ($re, $skip_self) = @_;
@@ -195,7 +238,7 @@ sub find_by_name {
 		my $de = File::DesktopEntry->new($f);
 		next unless ($de->get('Type') // '') eq 'Application';
 		next if ($de->get('Hidden') // '') eq 'true';
-		next unless grep { defined and $_ =~ $re } $de->get('Name'), $de->get('Name[C]');
+		next unless desktop_name_matches($de, $re);
 		next if $skip_self and is_self($de);
 		push @found, $f;
 	}
@@ -223,26 +266,25 @@ sub resolve_app {
 	my $app = shift;
 	if ($app =~ m{^/}) {
 		return $app if -f $app;
-		return (undef, "no such desktop file: $app");
+		return (undef, "no such file: $app");
 	}
-	my ($wild, $re, $lit) = app_glob($app);
-	if ($wild) {
-		# Names only; hidden entries and ourselves can never be the target.
-		my @found = find_by_name($re, 1);
-		return (undef, "no application name matches: $app") unless @found;
-		verbose("application $app matches " . scalar(@found) . " desktop file(s): "
-			. join(', ', @found) . "; using the first");
-		return $found[0];
-	}
-	my @ids = $lit =~ /\.desktop$/ ? ($lit) : ("$lit.desktop", lc($lit) . ".desktop");
-	for my $id (@ids) {
-		my $f = find_by_id($id);
+
+	# A .desktop basename is an ID, never a Name. In particular, don't strip
+	# the suffix and then accidentally resolve a different application by Name.
+	if ($app =~ /\.desktop$/) {
+		my $f = find_by_id($app);
 		return $f if defined $f;
+		return (undef, "desktop file ID not found: $app");
 	}
-	my ($f) = find_by_name($re);
-	return $f if defined $f;
-	return (undef, "application not found: $app");
-}
+
+	# Everything else is a Name, even if it contains slashes or resembles a
+	# path. '*' retains its documented case-insensitive wildcard meaning.
+	my ($wild, $re) = app_glob($app);
+	my @found = find_by_name($re, 1);
+	return (undef, "no application name matches: $app") unless @found;
+	verbose("application $app matches " . scalar(@found) . " desktop file(s): "
+		. join(', ', @found) . "; using the first");
+	return $found[0];
 
 # Does this desktop entry start us? (guards against infinite loops)
 sub is_self {
