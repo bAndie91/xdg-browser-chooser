@@ -195,13 +195,12 @@ sub find_by_name {
 	return;
 }
 
-# APPLICATION field of a rule -> path of a desktop file
+# APPLICATION field of a rule -> path of a desktop file, or (undef, reason)
 sub resolve_app {
 	my $app = shift;
 	if ($app =~ m{^/}) {
 		return $app if -f $app;
-		warn "$APP: no such desktop file: $app\n";
-		return;
+		return (undef, "no such desktop file: $app");
 	}
 	my @ids = $app =~ /\.desktop$/ ? ($app) : ("$app.desktop", lc($app) . ".desktop");
 	for my $id (@ids) {
@@ -210,8 +209,7 @@ sub resolve_app {
 	}
 	my $f = find_by_name($app);
 	return $f if defined $f;
-	warn "$APP: application not found: $app\n";
-	return;
+	return (undef, "application not found: $app");
 }
 
 # Does this desktop entry start us? (guards against infinite loops)
@@ -342,10 +340,12 @@ else {
 		next unless ($rule->{kind} eq 'host' ? $host : $target) =~ $rule->{re};
 		$matched++;
 		verbose("rule at line $rule->{line} matched: $rule->{pattern} -> $rule->{app}");
-		my $f = resolve_app($rule->{app});
+		my ($f, $err) = resolve_app($rule->{app});
+		# A matching rule that cannot be carried out is a configuration error:
+		# say so instead of quietly opening some other application.
 		unless (defined $f) {
-			verbose("rule at line $rule->{line} skipped, cannot resolve application $rule->{app}");
-			next;
+			warn "$APP: $cfg:$rule->{line}: $err\n";
+			exit 1;
 		}
 		if (is_self(File::DesktopEntry->new($f))) {
 			warn "$APP: $f would start $APP itself, skipping rule at line $rule->{line}\n";
