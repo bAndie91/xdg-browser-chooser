@@ -2,15 +2,23 @@
 default:
 	false
 
-INSTALL_TARGET = /usr/share/applications/xdg-browser-chooser.desktop
+DESKTOP_ENTRY_TARGET = /usr/share/applications/xdg-browser-chooser.desktop
+COMMAND_TARGET = /usr/local/bin/xdg-browser-chooser
 
 .PHONY: install
-install: $(INSTALL_TARGET)
+install: $(DESKTOP_ENTRY_TARGET) $(COMMAND_TARGET)
 	update-desktop-database
 
-$(INSTALL_TARGET): xdg-browser-chooser.desktop
+$(DESKTOP_ENTRY_TARGET): xdg-browser-chooser.desktop
+$(COMMAND_TARGET): xdg-browser-chooser
+
+$(DESKTOP_ENTRY_TARGET):
 	cp -v --no-preserve=ownership,mode --preserve=timestamps $< $@
+$(COMMAND_TARGET):
+	cp -v --no-preserve=ownership,mode --preserve=timestamps $< $@
+	chmod +x $@
 
 .PHONY: uninstall
 uninstall:
-	[ ! -e $(INSTALL_TARGET) ] || rm $(INSTALL_TARGET)
+	[ ! -e $(DESKTOP_ENTRY_TARGET) ] || rm $(DESKTOP_ENTRY_TARGET)
+	[ ! -e $(COMMAND_TARGET) ] || rm $(COMMAND_TARGET)
