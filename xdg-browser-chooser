@@ -285,6 +285,7 @@ sub resolve_app {
 	verbose("application $app matches " . scalar(@found) . " desktop file(s): "
 		. join(', ', @found) . "; using the first");
 	return $found[0];
+}
 
 # Does this desktop entry start us? (guards against infinite loops)
 sub is_self {
