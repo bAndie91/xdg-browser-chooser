@@ -232,7 +232,7 @@ sub mimeapps_files {
 
 sub fallback_file {
 	my $mime = shift;
-	# Candidates are [ desktop file ID, where it was listed, honor Removed Associations? ]
+	# Candidates are [ desktop file ID, where it was listed ]
 	my (@defaults, @added, %removed, @cached);
 	my @lists = mimeapps_files();
 	verbose("fallback: mimeapps.list files: " . (@lists ? join(' ', @lists) : '(none)'));
@@ -240,7 +240,7 @@ sub fallback_file {
 	for my $f (@lists) {
 		my $l = keyfile_lists($f, $mime);
 		push @defaults, map { [$_, "Default Applications in $f"] } @{ $l->{'Default Applications'} // [] };
-		push @added,    map { [$_, "Added Associations in $f", 1] } @{ $l->{'Added Associations'} // [] };
+		push @added,    map { [$_, "Added Associations in $f"] } @{ $l->{'Added Associations'} // [] };
 		$removed{$_} //= $f for @{ $l->{'Removed Associations'} // [] };
 	}
 	for my $dir (app_dirs()) {
@@ -251,10 +251,9 @@ sub fallback_file {
 	verbose("fallback: " . scalar(@candidates) . " candidate(s) for $mime, best first");
 	my %seen;
 	for my $c (@candidates) {
-		my ($id, $src, $honor_removed) = @$c;
+		my ($id, $src) = @$c;
 		my $skip = sub { verbose("fallback: $id ($src): skipped, $_[0]") };
-		$skip->("listed in Removed Associations in $removed{$id}"), next
-			if $honor_removed and $removed{$id};
+		$skip->("listed in Removed Associations in $removed{$id}"), next if $removed{$id};
 		$skip->('already considered'), next if $seen{$id}++;
 		my $f = find_by_id($id) or $skip->('no such desktop file'), next;
 		my $de = File::DesktopEntry->new($f);
