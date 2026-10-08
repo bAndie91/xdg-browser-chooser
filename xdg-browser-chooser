@@ -202,7 +202,7 @@ sub is_self {
 	my $de = shift;
 	my $exec = $de->get('Exec');
 	return 0 unless defined $exec;
-	$exec =~ /^\s*(?:"((?:[^"\\]|\\.)+)"|(\S+))/ or return 0;
+	$exec =~ /^\s*(?:"((?:[^""\\]|\\.)+)"|(\S+))/ or return 0;
 	my $cmd = $1 // $2;
 	unless ($cmd =~ m{/}) {
 		my ($found) = grep { -x "$_/$cmd" and !-d "$_/$cmd" } split /:/, ($ENV{PATH} // '');
