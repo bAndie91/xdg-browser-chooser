@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Web Browser Chooser
+Comment=Open http(s) links in the application chosen by URL pattern
+Exec=xdg-browser-chooser %u
+Terminal=false
+NoDisplay=true
+Categories=Network;WebBrowser;
+MimeType=x-scheme-handler/http;x-scheme-handler/https;

@@ -1,0 +1,316 @@
+#!/usr/bin/perl
+#
+# xdg-browser-chooser - http/https scheme handler which does nothing but hand the
+# URL over to another installed application, chosen by URL pattern.
+#
+# Config: $XDG_CONFIG_HOME/xdg-browser-chooser/rules.conf (or any dir of
+#         $XDG_CONFIG_DIRS), or the file given with -c.
+#
+#   # comment
+#   PATTERN  APPLICATION
+#
+# PATTERN without "/"  -> host name match (case-insensitive):
+#     example.com        exactly that host
+#     .example.com       example.com and any subdomain of it
+#     *.example.com      exactly one extra label; NOT example.com itself
+#     www*.example.com   '*' inside a label matches within that label only
+#     **.example.com     any number of extra labels; NOT example.com itself
+# PATTERN with "/"     -> Perl regexp, must match the *whole* of
+#     HOST[:PORT]/PATH   (no scheme, no query string, no fragment; the port
+#     is present only if it is not the scheme's default one; path is "/" at
+#     minimum, percent-encoded as in the URL).  PATTERN cannot contain
+#     whitespace - use \s or [[:blank:]].
+#
+# APPLICATION          -> a desktop file ID ("firefox.desktop" or an application
+#     name ("Firefox"), or, when it starts with "/", the path of a .desktop file
+#     used as is.
+#
+# First matching rule wins. If nothing matches, the next handler for
+# x-scheme-handler/<scheme> is used (see fallback_file() below).
+
+use strict;
+use warnings;
+
+use Cwd qw(abs_path);
+use File::Basename qw(dirname);
+use File::DesktopEntry;
+use File::Find ();
+use File::Spec;
+use File::XDG 1.00;
+use Getopt::Long qw(:config no_ignore_case bundling);
+use URI;
+
+my $APP  = 'xdg-browser-chooser';
+my $SELF = abs_path($0) // $0;
+
+my ($opt_dry, $opt_verbose);
+GetOptions(
+	'n|dry-run'   => \$opt_dry,
+	'v|verbose'   => \$opt_verbose,
+	'h|help'      => sub { usage(0) },
+) or usage(2);
+usage(2) unless @ARGV == 1;
+my $url = $ARGV[0];
+
+# File::XDG: config_home()/data_home() are suffixed with the application name,
+# the *_dirs_list() are not. Only the latter are used as they are.
+my $xdg = File::XDG->new(name => $APP, api => 1, path_class => 'File::Spec');
+
+sub verbose { print STDERR "$APP: @_\n" if $opt_verbose }
+sub usage {
+	my $rc = shift;
+	print { $rc ? *STDERR : *STDOUT } "usage: $APP [-n|--dry-run] [-v|--verbose] URL\n";
+	exit $rc;
+}
+
+###############################################################################
+# URL -> (host, "host[:port]/path")
+
+sub split_url {
+	my $uri = shift;
+	my $scheme = lc($uri->scheme // '');
+	return unless $scheme eq 'http' or $scheme eq 'https';
+	my $host = eval { $uri->host };
+	return unless defined $host and length $host;
+	$host = lc $host;
+	$host =~ s/\.$//;
+	my $hostport = $host =~ /:/ ? "[$host]" : $host;     # IPv6 literal
+	my $port = $uri->port;
+	$hostport .= ":$port" if defined $port and $port != $uri->default_port;
+	my $path = $uri->path;
+	$path = '/' if $path eq '';
+	return ($host, $hostport . $path);
+}
+
+###############################################################################
+# Config
+
+sub host_pattern_to_regex {
+	my $p = lc shift;
+	$p =~ s/\.$//;
+	my $subdomains = ($p =~ s/^\.//);
+	return undef if $p eq '';
+	my $body = join '\.', map {
+		$_ eq '*'
+			? '[^.]+'                                      # a whole label
+			: join('[^.]*', map { quotemeta } split(/\*/, $_, -1))
+	} split /\./, $p, -1;
+	$body = '(?:[^.]+\.)*' . $body if $subdomains;
+	return qr/^$body$/;
+}
+
+sub load_rules {
+	my $file = shift;
+	open my $fh, '<:encoding(UTF-8)', $file or die "$APP: $file: $!\n";
+	my @rules;
+	while (my $line = <$fh>) {
+		chomp $line;
+		$line =~ s/^\s+//;
+		$line =~ s/\s+$//;
+		next if $line eq '' or $line =~ /^#/;
+		my ($pat, $app) = $line =~ /^(\S+)\s+(.+)$/
+			or do { warn "$APP: $file:$.: PATTERN and APPLICATION expected\n"; next };
+		my ($kind, $re);
+		if ($pat =~ m{/}) {
+			$kind = 'uri';
+			$re = eval { qr/^(?:$pat)$/ };
+			if ($@) { warn "$APP: $file:$.: bad regexp: $@"; next }
+		}
+		else {
+			$kind = 'host';
+			$re = host_pattern_to_regex($pat)
+				or do { warn "$APP: $file:$.: bad host pattern\n"; next };
+		}
+		push @rules, { kind => $kind, re => $re, pattern => $pat, app => $app, line => $. };
+	}
+	close $fh;
+	return @rules;
+}
+
+###############################################################################
+# Finding desktop files
+
+sub app_dirs {
+	return map { File::Spec->catdir($_, 'applications') }
+		dirname($xdg->data_home), $xdg->data_dirs_list;
+}
+
+sub find_by_id {
+	my $id = shift;
+	# "a-b-c.desktop" may also live as a/b-c.desktop, a/b/c.desktop
+	my @parts = split /-/, $id;
+	my @variants = ($id);
+	push @variants, join('/', @parts[0 .. $_ - 1]) . '/' . join('-', @parts[$_ .. $#parts])
+		for 1 .. $#parts;
+	for my $dir (app_dirs()) {
+		for my $v (@variants) {
+			my $f = "$dir/$v";
+			return $f if -f $f;
+		}
+	}
+	return;
+}
+
+my @all_desktop_files;
+sub all_desktop_files {
+	unless (@all_desktop_files) {
+		for my $dir (app_dirs()) {
+			next unless -d $dir;
+			File::Find::find({
+				no_chdir => 1,
+				wanted   => sub { push @all_desktop_files, $_ if /\.desktop$/ and -f $_ },
+			}, $dir);
+		}
+	}
+	return @all_desktop_files;
+}
+
+sub find_by_name {
+	my $want = lc shift;
+	for my $f (all_desktop_files()) {
+		my $de = File::DesktopEntry->new($f);
+		next unless ($de->get('Type') // '') eq 'Application';
+		next if ($de->get('Hidden') // '') eq 'true';
+		for my $n (grep { defined } $de->get('Name'), $de->get('Name[C]')) {
+			return $f if lc $n eq $want;
+		}
+	}
+	return;
+}
+
+# APPLICATION field of a rule -> path of a desktop file
+sub resolve_app {
+	my $app = shift;
+	if ($app =~ m{^/}) {
+		return $app if -f $app;
+		warn "$APP: no such desktop file: $app\n";
+		return;
+	}
+	my @ids = $app =~ /\.desktop$/ ? ($app) : ("$app.desktop", lc($app) . ".desktop");
+	for my $id (@ids) {
+		my $f = find_by_id($id);
+		return $f if defined $f;
+	}
+	my $f = find_by_name($app);
+	return $f if defined $f;
+	warn "$APP: application not found: $app\n";
+	return;
+}
+
+# Does this desktop entry start us? (guards against infinite loops)
+sub is_self {
+	my $de = shift;
+	my $exec = $de->get('Exec');
+	return 0 unless defined $exec;
+	$exec =~ /^\s*(?:"((?:[^"\\]|\\.)+)"|(\S+))/ or return 0;
+	my $cmd = $1 // $2;
+	unless ($cmd =~ m{/}) {
+		my ($found) = grep { -x "$_/$cmd" and !-d "$_/$cmd" } split /:/, ($ENV{PATH} // '');
+		return 0 unless defined $found;
+		$cmd = "$found/$cmd";
+	}
+	return (abs_path($cmd) // '') eq $SELF ? 1 : 0;
+}
+
+###############################################################################
+# Fallback: the default handler for x-scheme-handler/<scheme>
+#
+# We are (normally) registered as that default ourselves, so what we need is
+# the *next* one. Candidates, best first, following the mime-apps spec:
+#   1. "Default Applications" of all mimeapps.list files - the list order is
+#      the priority, so  x-scheme-handler/http=xdg-browser-chooser.desktop;firefox.desktop;
+#      makes firefox the fallback
+#   2. "Added Associations" of the same files
+#   3. applications/mimeinfo.cache
+# Whatever starts this very script, is hidden or is removed is skipped.
+
+sub keyfile_lists {
+	my ($file, $key) = @_;
+	my (%out, $section);
+	open my $fh, '<:encoding(UTF-8)', $file or return {};
+	while (<$fh>) {
+		chomp;
+		if (/^\s*\[(.+)\]\s*$/) { $section = $1; next }
+		next unless defined $section and /^\s*\Q$key\E\s*=\s*(.*?)\s*$/;
+		push @{ $out{$section} }, grep { length } split /;/, $1;
+	}
+	return \%out;
+}
+
+sub mimeapps_files {
+	my @desktops = map { lc } grep { length } split /:/, ($ENV{XDG_CURRENT_DESKTOP} // '');
+	my @dirs = (
+		dirname($xdg->config_home), $xdg->config_dirs_list,
+		app_dirs(),
+	);
+	return grep { -f } map {
+		my $d = $_;
+		((map { "$d/$_-mimeapps.list" } @desktops), "$d/mimeapps.list")
+	} @dirs;
+}
+
+sub fallback_file {
+	my $mime = shift;
+	my (@defaults, @added, %removed, @cached);
+	for my $f (mimeapps_files()) {
+		my $l = keyfile_lists($f, $mime);
+		push @defaults, @{ $l->{'Default Applications'} // [] };
+		push @added,    @{ $l->{'Added Associations'}   // [] };
+		$removed{$_} = 1 for @{ $l->{'Removed Associations'} // [] };
+	}
+	for my $dir (app_dirs()) {
+		my $f = "$dir/mimeinfo.cache";
+		push @cached, @{ keyfile_lists($f, $mime)->{'MIME Cache'} // [] } if -f $f;
+	}
+	my %seen;
+	for my $id (@defaults, grep { !$removed{$_} } @added, @cached) {
+		next if $seen{$id}++;
+		my $f = find_by_id($id) or next;
+		my $de = File::DesktopEntry->new($f);
+		next unless ($de->get('Type') // '') eq 'Application';
+		next if ($de->get('Hidden') // '') eq 'true';
+		next if is_self($de);
+		return $f;
+	}
+	return;
+}
+
+###############################################################################
+
+my $uri = URI->new($url)->canonical;
+my ($host, $target) = split_url($uri);
+my $file;
+
+if (defined $host) {
+	my $cfg = $xdg->lookup_config_file('rules.conf');
+	verbose("config: $cfg");
+	for my $rule (load_rules($cfg)) {
+		next unless ($rule->{kind} eq 'host' ? $host : $target) =~ $rule->{re};
+		verbose("rule at line $rule->{line} matched: $rule->{pattern} -> $rule->{app}");
+		my $f = resolve_app($rule->{app}) or next;
+		if (is_self(File::DesktopEntry->new($f))) {
+			warn "$APP: $f would start $APP itself, skipping rule at line $rule->{line}\n";
+			next;
+		}
+		$file = $f;
+		last;
+	}
+}
+
+unless (defined $file) {
+	my $scheme = lc($uri->scheme // '');
+	verbose("no rule matched, falling back to x-scheme-handler/$scheme");
+	$file = fallback_file("x-scheme-handler/$scheme")
+		// die "$APP: no handler found for x-scheme-handler/$scheme\n";
+}
+
+my $entry = File::DesktopEntry->new($file);
+verbose("using $file");
+
+if ($opt_dry) {
+	print "$file\n", join(' ', $entry->parse_Exec($url)), "\n";
+	exit 0;
+}
+
+$entry->exec($url);
+die "$APP: cannot execute $file: $!\n";
