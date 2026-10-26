@@ -181,40 +181,83 @@ sub all_desktop_files {
 	return @all_desktop_files;
 }
 
-# Return true if any relevant localized or untranslated Name matches. File::DesktopEntry
-# versions differ in whether get('Name') is locale-aware, so check it first; when
-# it matches there is no need to probe alternate translations.
-sub desktop_name_matches {
-	my ($de, $re) = @_;
-	my $name = $de->get('Name');
-	return 1 if defined $name and $name =~ $re;
+# PERFORMANCE NOTE: matching an APPLICATION by Name means looking into *every*
+# desktop file (typically several hundred). Doing that with File::DesktopEntry->new
+# (which parses and regexp-processes each file completely, all the translated
+# Name[xx]/Comment[xx] lines included) took ~300 ms for 560 files, versus ~40 ms
+# for the whole run when the rule names a .desktop ID. So the scan below only
+# extracts the handful of keys it needs, and stops at the first match unless
+# --verbose asked for the full list. File::DesktopEntry is still used for the
+# one file that is finally chosen (Exec= field-code expansion and exec).
 
-	my @locales;
-	my $locale = $ENV{LC_ALL} || $ENV{LC_MESSAGES} || $ENV{LANG} || '';
-	$locale =~ s/\..*//;
-	$locale =~ s/\@.*//;
-	push @locales, $locale if length $locale;
-	push @locales, qw(en_US en C);
-	my %seen;
-	for my $loc (@locales) {
-		next if $seen{$loc}++;
-		my $translated = $de->get("Name[$loc]");
+# Read Type, Hidden, Name and Name[xx] of the [Desktop Entry] group; undef if unreadable.
+# Escape sequences in values (\s, \n, ...) are not interpreted - irrelevant for names.
+sub desktop_header {
+	my $file = shift;
+	open my $fh, '<:raw', $file or return;
+	my (%h, $in_group);
+	while (<$fh>) {
+		if (/^\[(.*?)\]\s*$/) {
+			last if $in_group;                    # next group begins: done
+			$in_group = ($1 eq 'Desktop Entry');
+			next;
+		}
+		next unless $in_group;
+		next unless /^(Type|Hidden|Name(?:\[[^\]]*\])?)\s*=\s*(.*?)\s*$/;
+		my ($k, $v) = ($1, $2);
+		utf8::decode($v);       # desktop files are UTF-8; rules are character strings
+		$h{$k} = $v;
+	}
+	return \%h;
+}
+
+# Locales whose Name[...] translations count, per the Desktop Entry spec's matching
+# order for the current locale (lang_COUNTRY@MODIFIER, lang_COUNTRY, lang@MODIFIER,
+# lang), then en_US and en as a courtesy. The untranslated Name is always checked.
+my @name_locales;
+sub name_locales {
+	unless (@name_locales) {
+		my $l = $ENV{LC_ALL} || $ENV{LC_MESSAGES} || $ENV{LANG} || '';
+		$l =~ s/\..*?(?=@|$)//;                     # drop .encoding
+		my ($lang, $country, $mod) = $l =~ /^([^_@]+)(?:_([^@]+))?(?:@(.+))?$/;
+		my @chain;
+		if (defined $lang and $lang ne 'C' and $lang ne 'POSIX') {
+			push @chain, "${lang}_${country}\@$mod" if defined $country and defined $mod;
+			push @chain, "${lang}_$country"        if defined $country;
+			push @chain, "$lang\@$mod"             if defined $mod;
+			push @chain, $lang;
+		}
+		my %seen;
+		@name_locales = grep { !$seen{$_}++ } (@chain, qw(en_US en));
+	}
+	return @name_locales;
+}
+
+# Return true if the untranslated or any relevant translated Name matches.
+sub desktop_name_matches {
+	my ($h, $re) = @_;
+	my $name = $h->{Name};
+	return 1 if defined $name and $name =~ $re;
+	for my $loc (name_locales()) {
+		my $translated = $h->{"Name[$loc]"};
 		return 1 if defined $translated and $translated =~ $re;
 	}
 	return 0;
 }
 
 # Desktop files of the applications whose Name matches $re, in lookup order.
+# $limit > 0: stop after that many.
 sub find_by_name {
-	my ($re, $skip_self) = @_;
+	my ($re, $skip_self, $limit) = @_;
 	my @found;
 	for my $f (all_desktop_files()) {
-		my $de = File::DesktopEntry->new($f);
-		next unless ($de->get('Type') // '') eq 'Application';
-		next if ($de->get('Hidden') // '') eq 'true';
-		next unless desktop_name_matches($de, $re);
-		next if $skip_self and is_self($de);
+		my $h = desktop_header($f) or next;
+		next unless ($h->{Type} // '') eq 'Application';
+		next if ($h->{Hidden} // '') eq 'true';
+		next unless desktop_name_matches($h, $re);
+		next if $skip_self and is_self(File::DesktopEntry->new($f));
 		push @found, $f;
+		last if $limit and @found >= $limit;
 	}
 	return @found;
 }
@@ -254,7 +297,8 @@ sub resolve_app {
 	# Everything else is a Name, even if it contains slashes or resembles a
 	# path. '*' retains its documented case-insensitive wildcard meaning.
 	my ($wild, $re) = app_glob($app);
-	my @found = find_by_name($re, 1);
+	# Only the first match is used. Without --verbose stop scanning there.
+	my @found = find_by_name($re, 1, $opt_verbose ? 0 : 1);
 	return (undef, "no application name matches: $app") unless @found;
 	verbose("application $app matches " . scalar(@found) . " desktop file(s): "
 		. join(', ', @found) . "; using the first");
@@ -279,14 +323,69 @@ sub is_self {
 ###############################################################################
 # Fallback: the default handler for x-scheme-handler/<scheme>
 #
-# We are (normally) registered as that default ourselves, so what we need is
-# the *next* one. Candidates, best first, following the mime-apps spec:
-#   1. "Default Applications" of all mimeapps.list files - the list order is
-#      the priority, so  x-scheme-handler/http=xdg-browser-chooser.desktop;firefox.desktop;
-#      makes firefox the fallback
-#   2. "Added Associations" of the same files
-#   3. applications/mimeinfo.cache
+# Standard: "Association between MIME types and applications" (mime-apps-spec,
+# version 1.0.1), https://specifications.freedesktop.org/mime-apps/latest/
+#
+# Is more than one default application allowed per MIME type?
+#   Yes. The value of a key in the [Default Applications] group is a
+#   semicolon-separated *list* of desktop file IDs. The first one that is
+#   installed (and associated with the type) is the default; if it is gone,
+#   the next one is tried, and so on. We do the same, which is what makes
+#       x-scheme-handler/http=xdg-browser-chooser.desktop;firefox.desktop;
+#   work: we are the first entry, so firefox is "the default minus us".
+#
+# Which mimeapps.list is what? The spec's lookup order, highest precedence first:
+#   $XDG_CONFIG_HOME/$desktop-mimeapps.list   (~/.config)  user, desktop-specific
+#   $XDG_CONFIG_HOME/mimeapps.list            (~/.config)  user settings; the
+#                                             recommended place, written by
+#                                             "xdg-mime default" and settings GUIs
+#   $XDG_CONFIG_DIRS/...                      (/etc/xdg)   sysadmin / vendor overrides
+#   $XDG_DATA_HOME/applications/...    (~/.local/share/applications)
+#                                             the *old* location of the user's file,
+#                                             kept only "for compatibility,
+#                                             deprecated": same format and syntax,
+#                                             but ranks below the config dirs; some
+#                                             older programs still read/write it
+#   $XDG_DATA_DIRS/applications/...    (/usr/share/applications)
+#                                             distribution defaults
+#   In each directory "$desktop-mimeapps.list" (one per component of
+#   $XDG_CURRENT_DESKTOP, lowercased) is looked at before "mimeapps.list".
+#   Desktop-specific files may only contain [Default Applications]; the Added /
+#   Removed groups are valid only in the plain mimeapps.list, so we ignore
+#   them in $desktop-mimeapps.list.
+#
+# And defaults.list? It is not part of the spec at all (1.0.1 does not mention it).
+#   It is the predecessor of mimeapps.list: $XDG_DATA_DIRS/applications/defaults.list
+#   (and the same under $XDG_DATA_HOME/applications, e.g.
+#   ~/.local/share/applications/defaults.list), carrying only a [Default Applications]
+#   group. GLib deprecated it in 2014 in favour of mimeapps.list in the data
+#   directories, but old tools and old setups still have or read it. As it has no
+#   defined precedence, we use it as the lowest-priority source of
+#   *default* applications: consulted only after every mimeapps.list had its say.
+#
+# mimeinfo.cache (written by update-desktop-database, one per applications
+#   directory) is a precomputed index of the MimeType= lines of the desktop files
+#   there: MIME type -> IDs of the applications declaring it. It knows nothing of
+#   user choices; it answers "who *can* open this", not "who *should*". It can be
+#   stale (installing/removing a package without running update-desktop-database),
+#   so it ranks last, and every candidate is re-checked against the real file.
+#
+# Candidates, best first:
+#   1. "Default Applications" of all mimeapps.list files, in precedence order
+#      (list order = priority within a key), then of the legacy defaults.list
+#   2. "Added Associations" of the mimeapps.list files
+#   3. mimeinfo.cache
 # Whatever starts this very script, is hidden or is removed is skipped.
+#
+# Known simplifications relative to the spec's suggested algorithm:
+#   - A default is not verified to be "associated with the type" (i.e. listing
+#     the MIME type in MimeType= or in Added Associations). Whoever put it in
+#     [Default Applications] explicitly wanted it, so we take it as is.
+#   - "Removed Associations" is applied to every candidate, not only to desktop
+#     files in the same or a lower-precedence directory as the mimeapps.list that
+#     removes them.
+#   - No MIME type hierarchy (the spec repeats the process from the most specific
+#     to the least specific type); x-scheme-handler/* types have no parents.
 
 sub keyfile_lists {
 	my ($file, $key) = @_;
@@ -301,16 +400,29 @@ sub keyfile_lists {
 	return \%out;
 }
 
+# The mimeapps.list files that exist, highest precedence first, as
+# [ path, is_desktop_specific ] pairs. See the comment above for the order.
 sub mimeapps_files {
 	my @desktops = map { lc } grep { length } split /:/, ($ENV{XDG_CURRENT_DESKTOP} // '');
 	my @dirs = (
 		dirname($xdg->config_home), $xdg->config_dirs_list,
 		app_dirs(),
 	);
-	return grep { -f } map {
-		my $d = $_;
-		((map { "$d/$_-mimeapps.list" } @desktops), "$d/mimeapps.list")
-	} @dirs;
+	my @out;
+	for my $d (@dirs) {
+		for my $desktop (@desktops) {
+			my $f = "$d/$desktop-mimeapps.list";
+			push @out, [$f, 1] if -f $f;
+		}
+		my $f = "$d/mimeapps.list";
+		push @out, [$f, 0] if -f $f;
+	}
+	return @out;
+}
+
+# Legacy (pre-mimeapps.list) default applications, see the comment above.
+sub legacy_defaults_files {
+	return grep { -f } map { "$_/defaults.list" } app_dirs();
 }
 
 sub fallback_file {
@@ -318,13 +430,21 @@ sub fallback_file {
 	# Candidates are [ desktop file ID, where it was listed ]
 	my (@defaults, @added, %removed, @cached);
 	my @lists = mimeapps_files();
-	verbose("fallback: mimeapps.list files: " . (@lists ? join(' ', @lists) : '(none)'));
+	my @legacy = legacy_defaults_files();
+	verbose("fallback: mimeapps.list files: " . (@lists ? join(' ', map { $_->[0] } @lists) : '(none)'));
+	verbose("fallback: legacy defaults.list files: " . (@legacy ? join(' ', @legacy) : '(none)'));
 	verbose("fallback: application dirs: " . join(' ', app_dirs()));
-	for my $f (@lists) {
+	for my $e (@lists) {
+		my ($f, $desktop_specific) = @$e;
 		my $l = keyfile_lists($f, $mime);
 		push @defaults, map { [$_, "Default Applications in $f"] } @{ $l->{'Default Applications'} // [] };
+		next if $desktop_specific;    # Added/Removed Associations are not valid there
 		push @added,    map { [$_, "Added Associations in $f"] } @{ $l->{'Added Associations'} // [] };
 		$removed{$_} //= $f for @{ $l->{'Removed Associations'} // [] };
+	}
+	for my $f (@legacy) {
+		my $l = keyfile_lists($f, $mime);
+		push @defaults, map { [$_, "Default Applications in legacy $f"] } @{ $l->{'Default Applications'} // [] };
 	}
 	for my $dir (app_dirs()) {
 		my $f = "$dir/mimeinfo.cache";
